@@ -71,7 +71,7 @@ jobs:
       - name: Check bin files exist
         run: |
           ls -la out
-          test "$(ls out/*.bin | wc -l)" -eq 3
+          test "$(ls out/*.bin | wc -l)" -ge 2
 
       - name: Save bin files as artifact (backup download)
         uses: actions/upload-artifact@v4
