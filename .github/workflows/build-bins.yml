@@ -1,0 +1,34 @@
+name: Build Ashish 7seg clock with battery firmware
+
+# One run builds TWO firmware sets from WLED v0.14.4: 6-digit and 4-digit.
+# Each set has ESP8266 + ESP32 .bin files. Download them from the "Releases" page of the repo.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  WLED_TAG: v0.14.4
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { digits: 6d, leds: 53 }
+          - { digits: 4d, leds: 37 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: mine
+
+      - name: Get WLED source
+        run: git clone --depth 1 --branch "$WLED_TAG" https://github.com/wled/WLED.git wled || git clone --depth 1 --branch "$WLED_TAG" https://github.com/Aircoookie/WLED.git wled
+
+      - name: Add clock usermod, names, LED count, build number
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+          LEDS: ${{ matrix.leds }}
