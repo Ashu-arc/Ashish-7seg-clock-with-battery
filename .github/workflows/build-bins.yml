@@ -34,3 +34,51 @@ jobs:
           cp mine/usermod_ashish_clock_7seg_battery.h wled/usermods/ashish_clock_7seg_battery/
           cp mine/platformio_override.ini wled/platformio_override.ini
           cd wled
+          python3 ../mine/patch_wled.py
+          sed -i 's|^#define DEFAULT_AP_SSID .*|#define DEFAULT_AP_SSID     "CLOCK (Ashish Automation)"|' wled00/const.h
+          sed -i -E "s|^([[:space:]]*)#define DEFAULT_LED_COUNT [0-9]+|\1#define DEFAULT_LED_COUNT ${{ matrix.leds }}|" wled00/const.h
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install tools
+        run: |
+          python -m venv /tmp/esptoolenv
+          /tmp/esptoolenv/bin/pip install "esptool==4.8.1"
+          pip install platformio
+          cd wled
+          npm ci
+          npm run build
+
+      - name: Build firmware
+        run: |
+          cd wled
+          pio run -e ashish_bat_${{ matrix.digits }}_esp8266 -e ashish_bat_${{ matrix.digits }}_esp32 || pio run -e ashish_bat_${{ matrix.digits }}_esp8266 -e ashish_bat_${{ matrix.digits }}_esp32
+
+      - name: Collect bin files
+        run: bash mine/collect_bins.sh ${{ matrix.digits }}
+
+      - name: Check bin files exist
+        run: |
+          ls -la out
+          test "$(ls out/*.bin | wc -l)" -eq 3
+
+      - name: Save bin files as artifact (backup download)
+        uses: actions/upload-artifact@v4
+        with:
+          name: bins-${{ matrix.digits }}
+          path: out/*.bin
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: battery-clock-${{ matrix.digits }}-${{ github.run_number }}
+          name: Battery clock ${{ matrix.digits }} - WLED v0.14.4 - build ${{ github.run_number }}
+          files: out/*.bin
