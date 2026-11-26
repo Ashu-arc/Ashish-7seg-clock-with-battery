@@ -17,6 +17,10 @@
 
 #include "wled.h"
 
+#ifdef ESP8266
+  #include <SoftwareSerial.h>   // DFPlayer Mini on ESP8266 (ESP32 uses Serial2)
+#endif
+
 // works on WLED 0.14.4 (VERSION 2405180) and WLED 0.15.0 (VERSION 2412100)
 #if VERSION >= 2410000
   #define C7_PM PinManager::
@@ -47,10 +51,14 @@
 #ifdef ESP8266
   #define C7_DEF_BAT 17         // A0 (fixed on ESP8266)
   #define C7_DEF_CHG 14         // D5
+  #define C7_DEF_TRX 12         // D6  <- DFPlayer TX
+  #define C7_DEF_TTX 13         // D7  -> DFPlayer RX (through 1k resistor)
   #define C7_DEF_BATMUL 4.2f    // NodeMCU / D1 mini: 100k in series from battery +
 #else
   #define C7_DEF_BAT 35         // ADC1 pin (32-39)
   #define C7_DEF_CHG 27
+  #define C7_DEF_TRX 16         // Serial2 RX <- DFPlayer TX
+  #define C7_DEF_TTX 17         // Serial2 TX -> DFPlayer RX (through 1k resistor)
   #define C7_DEF_BATMUL 2.0f    // 100k + 100k divider
 #endif
 
@@ -174,6 +182,28 @@ class UsermodAshishClock7SegBat : public Usermod {
     uint8_t sleepOff     = 25;             // seconds OFF
     bool    jsonOn       = true;           // battery values in /json/state
 
+    // ---------- Bangla talking clock (DFPlayer Mini) ----------
+    bool    talkOn       = false;
+    int8_t  talkRx       = C7_DEF_TRX;     // ESP RX  <- DFPlayer TX (-1 = not connected, fixed word timing)
+    int8_t  talkTx       = C7_DEF_TTX;     // ESP TX  -> DFPlayer RX
+    uint8_t talkVol      = 20;             // 0..30
+    bool    talkHourly   = true;           // speak the time every full hour
+    uint8_t talkFrom     = 7;              // hourly speech from hour
+    uint8_t talkTo       = 22;             // hourly speech until hour
+    bool    talkBtnTime  = true;           // short button press speaks the time
+    bool    talkBtnDate  = false;          // ... and the date
+    bool    talkBtnTemp  = false;          // ... and the temperature
+    bool    talkBtnBat   = false;          // ... and the battery
+    bool    talkAlarm    = true;           // speak when the alarm rings
+    bool    talkLowBat   = true;           // speak "battery low"
+    uint8_t talkLowMin   = 15;             // repeat battery warning every N minutes
+    uint16_t talkWordMs  = 1200;           // ms per word when no RX wire / no finish message
+    bool    talkWordMin  = true;           // say the word "minute" after the minutes
+    bool    talkWordBaje = true;           // say the closing word ("baje") after the time
+    bool    talkNums     = true;           // minute number clips 1-59 exist (off for the classic voice: only hour + 15/30/45 clips)
+    bool    talkQuarter  = false;          // also speak at :15 :30 :45 (inside From/To hour)
+    bool    talkExact    = false;          // use the special clips for exactly 15 / 30 / 45 minutes (tracks 116 / 117 / 118)
+
     // ---------- runtime ----------
     char     order[8]    = "FABGEDC";
     bool     orderBad    = false;
@@ -185,6 +215,14 @@ class UsermodAshishClock7SegBat : public Usermod {
     unsigned long lastBat = 0;
     bool charging = false, chgRaw = false, batLatched = false; int8_t heldChg = -1;
     unsigned long chgChange = 0, lastLowBeep = 0, lowBeepStart = 0, wakeUntil = 0;
+    bool dfActive = false, talkReady = false, talkBusy = false, trackDone = false, talkAck = false;
+    uint8_t talkStage = 0, talkHead = 0, talkLen = 0, talkTimeouts = 0, talkQ[32], rxBuf[10], rxLen = 0;
+    int8_t heldTRx = -1, heldTTx = -1;
+    unsigned long talkInitAt = 0, talkNextAt = 0, talkStart = 0, lastLowSay = 0;
+    uint32_t talkKey = 0;
+    #ifdef ESP8266
+    SoftwareSerial* dfSer = nullptr;
+    #endif
     bool     rtcPinError = false;
     bool     rtcLoaded   = false;
     bool     rtcWritten  = false;
@@ -381,6 +419,7 @@ class UsermodAshishClock7SegBat : public Usermod {
       if (heldBtn >= 0) { C7_PM deallocatePin(heldBtn, PinOwner::UM_Unspecified); heldBtn = -1; }
       if (heldBat >= 0) { C7_PM deallocatePin(heldBat, PinOwner::UM_Unspecified); heldBat = -1; }
       if (heldChg >= 0) { C7_PM deallocatePin(heldChg, PinOwner::UM_Unspecified); heldChg = -1; }
+      talkEnd();
     }
 
     // ---------- I2C helpers (used by the DS3231 status register) ----------
@@ -440,6 +479,7 @@ class UsermodAshishClock7SegBat : public Usermod {
       if (buttonPin >= 0 && C7_PM allocatePin(buttonPin, false, PinOwner::UM_Unspecified)) {
         heldBtn = buttonPin; pinMode(heldBtn, INPUT_PULLUP);
       }
+      dfBegin();
     }
 
     // ---------- battery ----------
@@ -542,6 +582,162 @@ class UsermodAshishClock7SegBat : public Usermod {
     void handleLdr(unsigned long) {}              // ESP8266: A0 is used by the battery, no LDR
     #endif
 
+    // ---------- Bangla talking clock (DFPlayer Mini, SD card: /MP3/0001.mp3 ... 0190.mp3) ----------
+    // track map: 1-99 numbers, 100 zero, 101-112 hours (1 o'clock..12 o'clock), 113 "now the time is", 114 "minutes", 115 "o'clock/it is",
+    // 120-125 morning/noon/afternoon/evening/night/dawn, 130-136 Sunday..Saturday, 140-151 January..December, 160 "today", 162 "year", 163 "two thousand",
+    // 170 "temperature", 171 "degree celsius", 172 "degree fahrenheit", 173 "minus", 180 "battery", 181 "percent", 182 "one hundred",
+    // 116/117/118 exact 15/30/45 minute clips (classic voice), 183 "battery low, please charge", 184 "charging", 190 alarm message
+    void talkEnd() {
+      talkReady = false; talkBusy = false; talkLen = 0; talkHead = 0; talkStage = 0;
+      #ifdef ESP8266
+      if (dfSer) { dfSer->end(); delete dfSer; dfSer = nullptr; }
+      #else
+      if (dfActive) Serial2.end();
+      #endif
+      dfActive = false;
+      if (heldTRx >= 0) { C7_PM deallocatePin(heldTRx, PinOwner::UM_Unspecified); heldTRx = -1; }
+      if (heldTTx >= 0) { C7_PM deallocatePin(heldTTx, PinOwner::UM_Unspecified); heldTTx = -1; }
+    }
+
+    void dfBegin() {
+      talkAck = false; talkStage = 0; talkReady = false; rxLen = 0;
+      if (!talkOn || talkTx < 0) return;
+      if (!C7_PM allocatePin(talkTx, true, PinOwner::UM_Unspecified)) return;
+      heldTTx = talkTx;
+      if (talkRx >= 0 && C7_PM allocatePin(talkRx, false, PinOwner::UM_Unspecified)) heldTRx = talkRx;
+      #ifdef ESP8266
+      dfSer = new SoftwareSerial(heldTRx, talkTx);
+      dfSer->begin(9600);
+      #else
+      Serial2.begin(9600, SERIAL_8N1, heldTRx >= 0 ? heldTRx : 16, talkTx);
+      #endif
+      dfActive = true;
+      talkInitAt = millis() + 2000UL; talkStage = 1;                          // DFPlayer needs about 2 s to read the SD card
+    }
+
+    void dfWrite(const uint8_t* b, uint8_t n) {
+      #ifdef ESP8266
+      if (dfSer) dfSer->write(b, n);
+      #else
+      Serial2.write(b, n);
+      #endif
+    }
+
+    void dfCmd(uint8_t cmd, uint8_t p1, uint8_t p2) {
+      uint8_t f[10] = {0x7E, 0xFF, 0x06, cmd, 0x01, p1, p2, 0, 0, 0xEF};
+      uint16_t sum = 0;
+      for (uint8_t i = 1; i < 7; i++) sum += f[i];
+      sum = (uint16_t)(0 - sum);
+      f[7] = sum >> 8; f[8] = sum & 0xFF;
+      dfWrite(f, 10);
+    }
+
+    void dfPoll(unsigned long now) {                           // reads DFPlayer answers: any frame = module alive, 0x3D = track finished
+      for (;;) {
+        #ifdef ESP8266
+        if (!dfSer || dfSer->available() <= 0) break;
+        int c = dfSer->read();
+        #else
+        if (Serial2.available() <= 0) break;
+        int c = Serial2.read();
+        #endif
+        if (rxLen == 0 && c != 0x7E) continue;
+        rxBuf[rxLen++] = (uint8_t)c;
+        if (rxLen >= 10) {
+          if (rxBuf[9] == 0xEF) {
+            talkAck = true;
+            if (rxBuf[3] == 0x3D && now - talkStart > 150) trackDone = true;          // track finished
+            if (rxBuf[3] == 0x40 && talkBusy) trackDone = true;                        // error (file not found): go on with the next word
+          }
+          rxLen = 0;
+        }
+      }
+    }
+
+    void talkLoop(unsigned long now) {
+      if (!dfActive) return;
+      dfPoll(now);
+      if (talkStage) {                                         // start-up: select SD card, set volume
+        if ((long)(now - talkInitAt) < 0) return;
+        if (talkStage == 1) { dfCmd(0x09, 0, 2); talkInitAt = now + 400; talkStage = 2; }
+        else if (talkStage == 2) { dfCmd(0x06, 0, talkVol); talkInitAt = now + 300; talkStage = 3; }
+        else { talkStage = 0; talkReady = true; }
+        return;
+      }
+      if (talkBusy) {
+        bool useFinish = heldTRx >= 0 && talkTimeouts < 2;     // no finish message from this module twice: switch to fixed timing
+        unsigned long lim = useFinish ? 5000UL : talkWordMs;
+        if (trackDone) { talkTimeouts = 0; talkBusy = false; talkNextAt = now + 60; }
+        else if (now - talkStart > lim) { if (heldTRx >= 0 && talkTimeouts < 255) talkTimeouts++; talkBusy = false; talkNextAt = now + 60; }
+      }
+      if (!talkBusy && talkLen && (long)(now - talkNextAt) >= 0) {
+        uint8_t tr = talkQ[talkHead]; talkHead = (talkHead + 1) % 32; talkLen--;
+        dfCmd(0x12, 0, tr);                                    // play /MP3/000N.mp3
+        talkBusy = true; trackDone = false; talkStart = now;
+      }
+    }
+
+    void talkPush(uint8_t tr) {
+      if (!dfActive || talkLen >= 32) return;
+      talkQ[(talkHead + talkLen) % 32] = tr; talkLen++;
+    }
+
+    void stopTalk() { talkLen = 0; talkBusy = false; if (dfActive) dfCmd(0x16, 0, 0); }
+
+    void sayTime() {                                           // "now the time is <period> <hour>-o'clock <minute> minutes"
+      time_t t = localTime;
+      if (t < 1600000000L) return;
+      uint8_t h = hour(t), m = minute(t);
+      talkPush(113);
+      talkPush(h >= 4 && h < 6 ? 125 : (h >= 6 && h < 12 ? 120 : (h >= 12 && h < 16 ? 121 : (h >= 16 && h < 18 ? 122 : (h >= 18 && h < 20 ? 123 : 124)))));
+      uint8_t h12 = h % 12; if (h12 == 0) h12 = 12;
+      talkPush(100 + h12);
+      if (talkExact && (m == 15 || m == 30 || m == 45)) talkPush(m == 15 ? 116 : (m == 30 ? 117 : 118));   // classic voice: exact minute clips
+      else if (m && talkNums) { talkPush(m); if (talkWordMin) talkPush(114); }
+      if (talkWordBaje) talkPush(115);
+    }
+
+    void sayDate() {                                           // "today <weekday> <day> <month> two-thousand <year> year"
+      time_t t = localTime;
+      if (t < 1600000000L) return;
+      talkPush(160);
+      talkPush(130 + (weekday(t) - 1));
+      talkPush(day(t));
+      talkPush(140 + (month(t) - 1));
+      int y = year(t);
+      if (y >= 2000 && y < 2100) { talkPush(163); if (y % 100) talkPush(y % 100); }
+      talkPush(162);
+    }
+
+    void sayTemp() {
+      if (!tempUsable()) return;
+      int tv = tempShown(); bool neg = tv < 0; int a = abs(tv); if (a > 99) a = 99;
+      talkPush(170);
+      if (neg) talkPush(173);
+      talkPush(a == 0 ? 100 : a);
+      talkPush(tempUnit ? 172 : 171);
+    }
+
+    void sayBattery() {
+      if (batV < 0) return;
+      talkPush(180);
+      int pc = batPct < 0 ? 0 : batPct;
+      talkPush(pc >= 100 ? 182 : (pc == 0 ? 100 : pc));
+      talkPush(181);
+      if (charging) talkPush(184);
+    }
+
+    void sayButton() {
+      if (talkBtnTime) sayTime();
+      if (talkBtnDate) sayDate();
+      if (talkBtnTemp) sayTemp();
+      if (talkBtnBat) sayBattery();
+    }
+
+    void sayCmd(uint8_t c) {                                   // from JSON {"clk7":{"say":1}}: 1 time, 2 date, 3 temperature, 4 battery, 5 stop
+      if (c == 1) sayTime(); else if (c == 2) sayDate(); else if (c == 3) sayTemp(); else if (c == 4) sayBattery(); else if (c == 5) stopTalk();
+    }
+
     // ---------- alarm / chime / button ----------
     bool alarmDayOk(uint8_t wd) const {          // wd: 1 = Sunday
       if (alarmDays == 1) return wd >= 2 && wd <= 6;
@@ -549,7 +745,10 @@ class UsermodAshishClock7SegBat : public Usermod {
       return true;
     }
 
-    void startRing() { ringing = true; ringEnd = millis() + (unsigned long)ringSec * 1000UL; }
+    void startRing() {
+      ringing = true; ringEnd = millis() + (unsigned long)ringSec * 1000UL;
+      if (talkOn && talkAlarm) { talkPush(190); sayTime(); }
+    }
 
     void checkAlarmAndChime() {
       time_t t = localTime;
@@ -564,6 +763,11 @@ class UsermodAshishClock7SegBat : public Usermod {
         bool inWin = chimeStart <= chimeEnd ? (h >= chimeStart && h <= chimeEnd) : (h >= chimeStart || h <= chimeEnd);
         uint32_t key = (uint32_t)(t / 3600);
         if (inWin && key != chimeKey) { chimeKey = key; chimeBeepStart = millis(); }
+      }
+      if (talkOn && talkHourly && (m == 0 || (talkQuarter && m % 15 == 0)) && s < 3) {   // speak the time every full hour (and every quarter)
+        bool inW = talkFrom <= talkTo ? (h >= talkFrom && h <= talkTo) : (h >= talkFrom || h <= talkTo);
+        uint32_t key = (uint32_t)(t / 900);
+        if (inW && key != talkKey) { talkKey = key; sayTime(); }
       }
     }
 
@@ -581,6 +785,7 @@ class UsermodAshishClock7SegBat : public Usermod {
         beepUntil = now + (alarmArmed ? 250 : 80);
       } else {
         peekStart = now;                           // show date for a few seconds
+        if (talkOn && (talkBtnTime || talkBtnDate || talkBtnTemp || talkBtnBat)) { if (talkBusy || talkLen) stopTalk(); else sayButton(); }
       }
     }
 
@@ -840,6 +1045,7 @@ class UsermodAshishClock7SegBat : public Usermod {
       unsigned long now = millis();
       pollButton(now);
       updateBuzzer(now);
+      talkLoop(now);
       if (syncState) pollEdge(now);
       if (now - lastTick < 100) return;
       lastTick = now;
@@ -856,6 +1062,9 @@ class UsermodAshishClock7SegBat : public Usermod {
       if (beepOn && batLow && !batCrit && !charging && !inNight()) {            // low battery beep
         if (lastLowBeep == 0 || now - lastLowBeep >= (unsigned long)beepMin * 60000UL) { lastLowBeep = now ? now : 1; lowBeepStart = now ? now : 1; }
       } else if (!batLow) lastLowBeep = 0;
+      if (talkOn && talkLowBat && batLow && !batCrit && !charging && !inNight()) {   // spoken low battery warning
+        if (lastLowSay == 0 || now - lastLowSay >= (unsigned long)talkLowMin * 60000UL) { lastLowSay = now ? now : 1; talkPush(183); }
+      } else if (!batLow) lastLowSay = 0;
 
       // RTC maintenance
       if (rtcEnabled && rtcReady) {
@@ -1101,6 +1310,14 @@ class UsermodAshishClock7SegBat : public Usermod {
         if (charging) a6b.add(F(" CHARGING")); else if (batCrit) a6b.add(F(" CUT-OFF")); else if (batLow) a6b.add(F(" LOW"));
       }
 
+      // 6c) Talking clock
+      JsonArray a6t = user.createNestedArray(F("Clock talking"));
+      if (!talkOn) a6t.add(F("off"));
+      else if (!dfActive) a6t.add(F("pin error"));
+      else if (!talkReady) a6t.add(F("starting..."));
+      else if (heldTRx < 0) a6t.add(F("ready (no RX wire, fixed timing)"));
+      else a6t.add(talkAck ? F("ready, DFPlayer answers") : F("ready, NO answer from DFPlayer (check wiring / SD card)"));
+
       // 7) Alarm
       JsonArray a7 = user.createNestedArray(F("Clock alarm"));
       if (!alarmOn) a7.add(F("off"));
@@ -1138,6 +1355,8 @@ class UsermodAshishClock7SegBat : public Usermod {
       testMode = o[F("test")] | testMode;
       dateShow = o[F("date")] | dateShow;
       enabled  = o[F("on")]   | enabled;
+      uint8_t say = o[F("say")] | 0;                  // {"clk7":{"say":1}} speaks the time (1 time, 2 date, 3 temp, 4 battery, 5 stop)
+      if (say) sayCmd(say);
     }
 
     // ---------- settings page ----------
@@ -1293,6 +1512,28 @@ class UsermodAshishClock7SegBat : public Usermod {
 
       JsonObject js = top.createNestedObject(F("json"));
       js[F("enabled")] = jsonOn;
+
+      JsonObject tk = top.createNestedObject(F("talking"));
+      tk[F("enabled")] = talkOn;
+      tk[F("rx-pin")] = talkRx;
+      tk[F("tx-pin")] = talkTx;
+      tk[F("volume")] = talkVol;
+      tk[F("hourly")] = talkHourly;
+      tk[F("from-hour")] = talkFrom;
+      tk[F("to-hour")] = talkTo;
+      tk[F("button-time")] = talkBtnTime;
+      tk[F("button-date")] = talkBtnDate;
+      tk[F("button-temp")] = talkBtnTemp;
+      tk[F("button-battery")] = talkBtnBat;
+      tk[F("alarm-say")] = talkAlarm;
+      tk[F("lowbat-say")] = talkLowBat;
+      tk[F("lowbat-min")] = talkLowMin;
+      tk[F("word-ms")] = talkWordMs;
+      tk[F("word-minute")] = talkWordMin;
+      tk[F("word-baje")] = talkWordBaje;
+      tk[F("exact-minute")] = talkExact;
+      tk[F("minute-numbers")] = talkNums;
+      tk[F("quarter-hours")] = talkQuarter;
     }
 
     bool readFromConfig(JsonObject& root) {
@@ -1457,6 +1698,29 @@ class UsermodAshishClock7SegBat : public Usermod {
       JsonObject js = top[F("json")];
       ok &= getJsonValue(js[F("enabled")], jsonOn, true);
       if (js.isNull()) ok = false;
+
+      JsonObject tk = top[F("talking")];
+      ok &= getJsonValue(tk[F("enabled")], talkOn, false);
+      ok &= getJsonValue(tk[F("rx-pin")], talkRx, (int8_t)C7_DEF_TRX);
+      ok &= getJsonValue(tk[F("tx-pin")], talkTx, (int8_t)C7_DEF_TTX);
+      ok &= getJsonValue(tk[F("volume")], talkVol, (uint8_t)20);
+      ok &= getJsonValue(tk[F("hourly")], talkHourly, true);
+      ok &= getJsonValue(tk[F("from-hour")], talkFrom, (uint8_t)7);
+      ok &= getJsonValue(tk[F("to-hour")], talkTo, (uint8_t)22);
+      ok &= getJsonValue(tk[F("button-time")], talkBtnTime, true);
+      ok &= getJsonValue(tk[F("button-date")], talkBtnDate, false);
+      ok &= getJsonValue(tk[F("button-temp")], talkBtnTemp, false);
+      ok &= getJsonValue(tk[F("button-battery")], talkBtnBat, false);
+      ok &= getJsonValue(tk[F("alarm-say")], talkAlarm, true);
+      ok &= getJsonValue(tk[F("lowbat-say")], talkLowBat, true);
+      ok &= getJsonValue(tk[F("lowbat-min")], talkLowMin, (uint8_t)15);
+      ok &= getJsonValue(tk[F("word-ms")], talkWordMs, (uint16_t)1200);
+      ok &= getJsonValue(tk[F("word-minute")], talkWordMin, true);
+      ok &= getJsonValue(tk[F("word-baje")], talkWordBaje, true);
+      ok &= getJsonValue(tk[F("exact-minute")], talkExact, false);
+      ok &= getJsonValue(tk[F("minute-numbers")], talkNums, true);
+      ok &= getJsonValue(tk[F("quarter-hours")], talkQuarter, false);
+      if (tk.isNull()) ok = false;
       if (bt.isNull()) ok = false;
 
       // sanity limits
@@ -1488,6 +1752,8 @@ class UsermodAshishClock7SegBat : public Usermod {
       if (batCutV >= batLowV) batCutV = batLowV - 0.1f;
       if (batRecV < batCutV + 0.2f) batRecV = batCutV + 0.2f;
       beepMin = constrain(beepMin, 1, 120); sleepAwake = constrain(sleepAwake, 1, 60); sleepOff = constrain(sleepOff, 5, 250);
+      talkVol = constrain(talkVol, 0, 30); talkFrom %= 24; talkTo %= 24; talkLowMin = constrain(talkLowMin, 1, 120); talkWordMs = constrain(talkWordMs, 300, 4000);
+      if (talkTx == talkRx) talkRx = -1;
 
       configRead = true;
       lastSig = 0xFFFFFFFF;
@@ -1523,6 +1789,8 @@ class UsermodAshishClock7SegBat : public Usermod {
       C7_OAPPEND("c7i('cutoff-recovery','recover-volt','Back ON above');");
       #ifndef ESP8266
       C7_OAPPEND("c7i('battery','min-bri-pct','At cut-off');");
+      C7_OAPPEND("c7i('talking','rx-pin','DFPlayer TX');");
+      C7_OAPPEND("c7i('talking','tx-pin','DFPlayer RX, 1k');");
       C7_OAPPEND("c7i('wiring','seg-order','If preset = Custom');");
       C7_OAPPEND("c7i('wiring','leds-per-colon','LEDs in ONE colon');");
       C7_OAPPEND("c7i('buzzer-button','buzzer-pin','-1 = none');");
