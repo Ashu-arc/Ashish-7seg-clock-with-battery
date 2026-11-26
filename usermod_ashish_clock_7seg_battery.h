@@ -17,9 +17,6 @@
 
 #include "wled.h"
 
-#ifdef ESP8266
-  #include <SoftwareSerial.h>   // DFPlayer Mini on ESP8266 (ESP32 uses Serial2)
-#endif
 
 // works on WLED 0.14.4 (VERSION 2405180) and WLED 0.15.0 (VERSION 2412100)
 #if VERSION >= 2410000
@@ -51,7 +48,7 @@
 #ifdef ESP8266
   #define C7_DEF_BAT 17         // A0 (fixed on ESP8266)
   #define C7_DEF_CHG 14         // D5
-  #define C7_DEF_TRX 12         // D6  <- DFPlayer TX
+  #define C7_DEF_TRX -1         // ESP8266: no RX wire (send only), use the BUSY pin instead
   #define C7_DEF_TTX 13         // D7  -> DFPlayer RX (through 1k resistor)
   #define C7_DEF_BATMUL 4.2f    // NodeMCU / D1 mini: 100k in series from battery +
 #else
@@ -186,6 +183,7 @@ class UsermodAshishClock7SegBat : public Usermod {
     bool    talkOn       = false;
     int8_t  talkRx       = C7_DEF_TRX;     // ESP RX  <- DFPlayer TX (-1 = not connected, fixed word timing)
     int8_t  talkTx       = C7_DEF_TTX;     // ESP TX  -> DFPlayer RX
+    int8_t  talkBusyPin  = -1;             // optional: DFPlayer BUSY pin (LOW while playing) = exact end of every word
     uint8_t talkVol      = 20;             // 0..30
     bool    talkHourly   = true;           // speak the time every full hour
     uint8_t talkFrom     = 7;              // hourly speech from hour
@@ -217,12 +215,9 @@ class UsermodAshishClock7SegBat : public Usermod {
     unsigned long chgChange = 0, lastLowBeep = 0, lowBeepStart = 0, wakeUntil = 0;
     bool dfActive = false, talkReady = false, talkBusy = false, trackDone = false, talkAck = false;
     uint8_t talkStage = 0, talkHead = 0, talkLen = 0, talkTimeouts = 0, talkQ[32], rxBuf[10], rxLen = 0;
-    int8_t heldTRx = -1, heldTTx = -1;
+    int8_t heldTRx = -1, heldTTx = -1, heldTBusy = -1;
     unsigned long talkInitAt = 0, talkNextAt = 0, talkStart = 0, lastLowSay = 0;
     uint32_t talkKey = 0;
-    #ifdef ESP8266
-    SoftwareSerial* dfSer = nullptr;
-    #endif
     bool     rtcPinError = false;
     bool     rtcLoaded   = false;
     bool     rtcWritten  = false;
@@ -589,14 +584,13 @@ class UsermodAshishClock7SegBat : public Usermod {
     // 116/117/118 exact 15/30/45 minute clips (classic voice), 183 "battery low, please charge", 184 "charging", 190 alarm message
     void talkEnd() {
       talkReady = false; talkBusy = false; talkLen = 0; talkHead = 0; talkStage = 0;
-      #ifdef ESP8266
-      if (dfSer) { dfSer->end(); delete dfSer; dfSer = nullptr; }
-      #else
+      #ifndef ESP8266
       if (dfActive) Serial2.end();
       #endif
       dfActive = false;
       if (heldTRx >= 0) { C7_PM deallocatePin(heldTRx, PinOwner::UM_Unspecified); heldTRx = -1; }
       if (heldTTx >= 0) { C7_PM deallocatePin(heldTTx, PinOwner::UM_Unspecified); heldTTx = -1; }
+      if (heldTBusy >= 0) { C7_PM deallocatePin(heldTBusy, PinOwner::UM_Unspecified); heldTBusy = -1; }
     }
 
     void dfBegin() {
@@ -604,20 +598,37 @@ class UsermodAshishClock7SegBat : public Usermod {
       if (!talkOn || talkTx < 0) return;
       if (!C7_PM allocatePin(talkTx, true, PinOwner::UM_Unspecified)) return;
       heldTTx = talkTx;
-      if (talkRx >= 0 && C7_PM allocatePin(talkRx, false, PinOwner::UM_Unspecified)) heldTRx = talkRx;
+      if (talkBusyPin >= 0 && talkBusyPin != talkTx && C7_PM allocatePin(talkBusyPin, false, PinOwner::UM_Unspecified)) { heldTBusy = talkBusyPin; pinMode(heldTBusy, INPUT_PULLUP); }
       #ifdef ESP8266
-      dfSer = new SoftwareSerial(heldTRx, talkTx);
-      dfSer->begin(9600);
+      if (talkTx > 15) { C7_PM deallocatePin(heldTTx, PinOwner::UM_Unspecified); heldTTx = -1; return; }   // ESP8266 send-only serial works on GPIO 0-15
+      pinMode(talkTx, OUTPUT); digitalWrite(talkTx, HIGH);
       #else
+      if (talkRx >= 0 && C7_PM allocatePin(talkRx, false, PinOwner::UM_Unspecified)) heldTRx = talkRx;
       Serial2.begin(9600, SERIAL_8N1, heldTRx >= 0 ? heldTRx : 16, talkTx);
       #endif
       dfActive = true;
       talkInitAt = millis() + 2000UL; talkStage = 1;                          // DFPlayer needs about 2 s to read the SD card
     }
 
+    #ifdef ESP8266
+    void bbByte(uint8_t b) {                                   // 1 start bit, 8 data bits, 1 stop bit at 9600 baud, about 1 ms with interrupts off
+      const uint32_t bitCycles = F_CPU / 9600UL;
+      uint16_t w = ((uint16_t)b << 1) | 0x200;
+      uint32_t mask = 1UL << talkTx;
+      noInterrupts();
+      uint32_t t = ESP.getCycleCount();
+      for (uint8_t i = 0; i < 10; i++) {
+        if ((w >> i) & 1) GPOS = mask; else GPOC = mask;
+        t += bitCycles;
+        while ((int32_t)(ESP.getCycleCount() - t) < 0) {}
+      }
+      interrupts();
+    }
+    #endif
+
     void dfWrite(const uint8_t* b, uint8_t n) {
       #ifdef ESP8266
-      if (dfSer) dfSer->write(b, n);
+      for (uint8_t i = 0; i < n; i++) { bbByte(b[i]); yield(); }      // ESP8266: send-only 9600 baud, bit-banged (SoftwareSerial does not compile with WLED 0.14.4)
       #else
       Serial2.write(b, n);
       #endif
@@ -633,14 +644,12 @@ class UsermodAshishClock7SegBat : public Usermod {
     }
 
     void dfPoll(unsigned long now) {                           // reads DFPlayer answers: any frame = module alive, 0x3D = track finished
+      #ifdef ESP8266
+      return;                                                  // ESP8266: send only (use the BUSY pin to know when a word ends)
+      #else
       for (;;) {
-        #ifdef ESP8266
-        if (!dfSer || dfSer->available() <= 0) break;
-        int c = dfSer->read();
-        #else
         if (Serial2.available() <= 0) break;
         int c = Serial2.read();
-        #endif
         if (rxLen == 0 && c != 0x7E) continue;
         rxBuf[rxLen++] = (uint8_t)c;
         if (rxLen >= 10) {
@@ -652,6 +661,7 @@ class UsermodAshishClock7SegBat : public Usermod {
           rxLen = 0;
         }
       }
+      #endif
     }
 
     void talkLoop(unsigned long now) {
@@ -665,10 +675,11 @@ class UsermodAshishClock7SegBat : public Usermod {
         return;
       }
       if (talkBusy) {
-        bool useFinish = heldTRx >= 0 && talkTimeouts < 2;     // no finish message from this module twice: switch to fixed timing
+        bool useFinish = (heldTRx >= 0 || heldTBusy >= 0) && talkTimeouts < 2;   // no finish signal twice: switch to fixed timing
+        if (heldTBusy >= 0 && now - talkStart > 400 && digitalRead(heldTBusy) == HIGH) trackDone = true;   // BUSY pin is LOW while a word plays
         unsigned long lim = useFinish ? 5000UL : talkWordMs;
         if (trackDone) { talkTimeouts = 0; talkBusy = false; talkNextAt = now + 60; }
-        else if (now - talkStart > lim) { if (heldTRx >= 0 && talkTimeouts < 255) talkTimeouts++; talkBusy = false; talkNextAt = now + 60; }
+        else if (now - talkStart > lim) { if ((heldTRx >= 0 || heldTBusy >= 0) && talkTimeouts < 255) talkTimeouts++; talkBusy = false; talkNextAt = now + 60; }
       }
       if (!talkBusy && talkLen && (long)(now - talkNextAt) >= 0) {
         uint8_t tr = talkQ[talkHead]; talkHead = (talkHead + 1) % 32; talkLen--;
@@ -1315,7 +1326,8 @@ class UsermodAshishClock7SegBat : public Usermod {
       if (!talkOn) a6t.add(F("off"));
       else if (!dfActive) a6t.add(F("pin error"));
       else if (!talkReady) a6t.add(F("starting..."));
-      else if (heldTRx < 0) a6t.add(F("ready (no RX wire, fixed timing)"));
+      else if (heldTBusy >= 0) a6t.add(F("ready (BUSY pin)"));
+      else if (heldTRx < 0) a6t.add(F("ready (send only, fixed word timing)"));
       else a6t.add(talkAck ? F("ready, DFPlayer answers") : F("ready, NO answer from DFPlayer (check wiring / SD card)"));
 
       // 7) Alarm
@@ -1517,6 +1529,7 @@ class UsermodAshishClock7SegBat : public Usermod {
       tk[F("enabled")] = talkOn;
       tk[F("rx-pin")] = talkRx;
       tk[F("tx-pin")] = talkTx;
+      tk[F("busy-pin")] = talkBusyPin;
       tk[F("volume")] = talkVol;
       tk[F("hourly")] = talkHourly;
       tk[F("from-hour")] = talkFrom;
@@ -1703,6 +1716,7 @@ class UsermodAshishClock7SegBat : public Usermod {
       ok &= getJsonValue(tk[F("enabled")], talkOn, false);
       ok &= getJsonValue(tk[F("rx-pin")], talkRx, (int8_t)C7_DEF_TRX);
       ok &= getJsonValue(tk[F("tx-pin")], talkTx, (int8_t)C7_DEF_TTX);
+      ok &= getJsonValue(tk[F("busy-pin")], talkBusyPin, (int8_t)-1);
       ok &= getJsonValue(tk[F("volume")], talkVol, (uint8_t)20);
       ok &= getJsonValue(tk[F("hourly")], talkHourly, true);
       ok &= getJsonValue(tk[F("from-hour")], talkFrom, (uint8_t)7);
@@ -1754,6 +1768,9 @@ class UsermodAshishClock7SegBat : public Usermod {
       beepMin = constrain(beepMin, 1, 120); sleepAwake = constrain(sleepAwake, 1, 60); sleepOff = constrain(sleepOff, 5, 250);
       talkVol = constrain(talkVol, 0, 30); talkFrom %= 24; talkTo %= 24; talkLowMin = constrain(talkLowMin, 1, 120); talkWordMs = constrain(talkWordMs, 300, 4000);
       if (talkTx == talkRx) talkRx = -1;
+      #ifdef ESP8266
+      talkRx = -1;                                            // ESP8266: send only
+      #endif
 
       configRead = true;
       lastSig = 0xFFFFFFFF;
