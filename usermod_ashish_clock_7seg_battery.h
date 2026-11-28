@@ -54,8 +54,8 @@
 #else
   #define C7_DEF_BAT 35         // ADC1 pin (32-39)
   #define C7_DEF_CHG 27
-  #define C7_DEF_TRX 16         // Serial2 RX <- DFPlayer TX
-  #define C7_DEF_TTX 17         // Serial2 TX -> DFPlayer RX (through 1k resistor)
+  #define C7_DEF_TRX 18         // Serial2 RX <- DFPlayer TX (not 16: WLED uses GPIO16 for LED data)
+  #define C7_DEF_TTX 19         // Serial2 TX -> DFPlayer RX (through 1k resistor)
   #define C7_DEF_BATMUL 2.0f    // 100k + 100k divider
 #endif
 
@@ -194,6 +194,7 @@ class UsermodAshishClock7SegBat : public Usermod {
     bool    talkBtnBat   = false;          // ... and the battery
     bool    talkAlarm    = true;           // speak when the alarm rings
     bool    talkLowBat   = true;           // speak "battery low"
+    bool    talkChgSay   = true;           // speak "charging" when the charger is connected, "battery full" when it ends full
     uint8_t talkLowMin   = 15;             // repeat battery warning every N minutes
     uint16_t talkWordMs  = 1200;           // ms per word when no RX wire / no finish message
     bool    talkWordMin  = true;           // say the word "minute" after the minutes
@@ -533,7 +534,13 @@ class UsermodAshishClock7SegBat : public Usermod {
       if (!chgOn || heldChg < 0) { charging = false; return; }
       bool raw = (digitalRead(heldChg) == (chgLow ? LOW : HIGH));
       if (raw != chgRaw) { chgRaw = raw; chgChange = now; }
-      if (raw != charging && now - chgChange > 2000) { charging = raw; batEval(); }
+      if (raw != charging && now - chgChange > 2000) {
+        charging = raw; batEval();
+        if (talkOn && talkChgSay) {                              // spoken charger events (tracks 184 / 185)
+          if (charging) talkPush(184);
+          else if (batV >= batMaxV - 0.1f) talkPush(185);
+        }
+      }
     }
 
     bool asleepNow() const {                                   // sleep on battery: display mostly off
@@ -581,7 +588,7 @@ class UsermodAshishClock7SegBat : public Usermod {
     // track map: 1-99 numbers, 100 zero, 101-112 hours (1 o'clock..12 o'clock), 113 "now the time is", 114 "minutes", 115 "o'clock/it is",
     // 120-125 morning/noon/afternoon/evening/night/dawn, 130-136 Sunday..Saturday, 140-151 January..December, 160 "today", 162 "year", 163 "two thousand",
     // 170 "temperature", 171 "degree celsius", 172 "degree fahrenheit", 173 "minus", 180 "battery", 181 "percent", 182 "one hundred",
-    // 116/117/118 exact 15/30/45 minute clips (classic voice), 183 "battery low, please charge", 184 "charging", 190 alarm message
+    // 116/117/118 exact 15/30/45 minute clips (classic voice), 183 "battery low, please charge", 184 "charging", 185 "battery full", 190 alarm message
     void talkEnd() {
       talkReady = false; talkBusy = false; talkLen = 0; talkHead = 0; talkStage = 0;
       #ifndef ESP8266
@@ -604,7 +611,7 @@ class UsermodAshishClock7SegBat : public Usermod {
       pinMode(talkTx, OUTPUT); digitalWrite(talkTx, HIGH);
       #else
       if (talkRx >= 0 && C7_PM allocatePin(talkRx, false, PinOwner::UM_Unspecified)) heldTRx = talkRx;
-      Serial2.begin(9600, SERIAL_8N1, heldTRx >= 0 ? heldTRx : 16, talkTx);
+      Serial2.begin(9600, SERIAL_8N1, heldTRx >= 0 ? heldTRx : 18, talkTx);
       #endif
       dfActive = true;
       talkInitAt = millis() + 2000UL; talkStage = 1;                          // DFPlayer needs about 2 s to read the SD card
@@ -1540,6 +1547,7 @@ class UsermodAshishClock7SegBat : public Usermod {
       tk[F("button-battery")] = talkBtnBat;
       tk[F("alarm-say")] = talkAlarm;
       tk[F("lowbat-say")] = talkLowBat;
+      tk[F("charge-say")] = talkChgSay;
       tk[F("lowbat-min")] = talkLowMin;
       tk[F("word-ms")] = talkWordMs;
       tk[F("word-minute")] = talkWordMin;
@@ -1727,6 +1735,7 @@ class UsermodAshishClock7SegBat : public Usermod {
       ok &= getJsonValue(tk[F("button-battery")], talkBtnBat, false);
       ok &= getJsonValue(tk[F("alarm-say")], talkAlarm, true);
       ok &= getJsonValue(tk[F("lowbat-say")], talkLowBat, true);
+      ok &= getJsonValue(tk[F("charge-say")], talkChgSay, true);
       ok &= getJsonValue(tk[F("lowbat-min")], talkLowMin, (uint8_t)15);
       ok &= getJsonValue(tk[F("word-ms")], talkWordMs, (uint16_t)1200);
       ok &= getJsonValue(tk[F("word-minute")], talkWordMin, true);
